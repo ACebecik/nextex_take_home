@@ -46,6 +46,21 @@ def receive_event():
     return jsonify({"status": "queued", "frame_saved": frame_path is not None}), 202
 
 
+@app.route('/telemetry', methods=['POST'])
+def receive_telemetry():
+    """Receives a windowed telemetry alarm/resolved event from a device --
+    NOT raw per-reading telemetry. The device does the K-of-N windowing
+    locally and only calls this on a state change (see design notes)."""
+    payload = request.get_json()
+    required_fields = {"device_id", "metric", "value", "status"}
+
+    if not payload or not required_fields.issubset(payload):
+        return jsonify({"error": "Invalid telemetry payload"}), 400
+
+    redis_client.lpush("telemetry_queue", json.dumps(payload))
+    return jsonify({"status": "queued"}), 202
+
+
 @app.route('/frames/<path:filename>', methods=['GET'])
 def get_frame(filename):
     """Lets a retraining job (or a future dashboard) pull back a previously uploaded frame."""
@@ -70,7 +85,16 @@ def metrics():
     frames_captured = c.execute(
         "SELECT COUNT(*) FROM events WHERE frame_path IS NOT NULL"
     ).fetchone()[0]
-    backlog = redis_client.llen("events_queue")
+
+    telemetry_total = c.execute("SELECT COUNT(*) FROM telemetry_alerts").fetchone()[0]
+    telemetry_rows = c.execute(
+        "SELECT metric, status, COUNT(*) FROM telemetry_alerts GROUP BY metric, status"
+    ).fetchall()
+    telemetry_by_metric = {}
+    for metric, status, count in telemetry_rows:
+        telemetry_by_metric.setdefault(metric, {})[status] = count
+
+    backlog = redis_client.llen("events_queue") + redis_client.llen("telemetry_queue")
 
     conn.close()
     return jsonify({
@@ -78,7 +102,9 @@ def metrics():
         "backlog": backlog,
         "events_by_type": {event_type: count for event_type, count in by_type},
         "alarms_by_class": {class_name: count for class_name, count in alarms_by_class},
-        "frames_captured": frames_captured
+        "frames_captured": frames_captured,
+        "telemetry_alerts_total": telemetry_total,
+        "telemetry_by_metric": telemetry_by_metric
     }), 200
 
 

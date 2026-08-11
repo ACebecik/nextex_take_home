@@ -11,8 +11,8 @@ nextex_take_home/
 ├── architecture_diagram.png
 ├── cloud/
 │   ├── Dockerfile
-│   ├── api.py          # Flask app: POST /events, GET /frames/<file>, GET /metrics
-│   ├── consumer.py      # drains the Redis queue into SQLite
+│   ├── api.py          # Flask app: POST /events, POST /telemetry, GET /frames/<file>, GET /metrics
+│   ├── consumer.py      # drains events_queue + telemetry_queue into SQLite
 │   ├── requirements.txt
 │   └── data/            # SQLite file + uploaded frames live here (Docker volume)
 └── simulator/
@@ -65,15 +65,13 @@ re-verifying on a different Docker environment before relying on it.
 
 Separately confirmed: even without automatic restart, no data is lost
 while `consumer` is down — Redis holds the full backlog (`backlog: 15`
-in `/metrics`) until a consumer resumes reading, at which point it
-drains completely (`backlog: 0`) with all events and their frames intact.
-Manually restarting the container (`docker compose start consumer`) was
-sufficient to trigger a full catch-up. This means the automatic-restart
-gap noted above affects *recovery time*, not data integrity — the queue
-itself is the safety net regardless of whether the consumer comes back
-on its own or via manual intervention.
-
-
+observed in `/metrics`) until a consumer resumes reading, at which point
+it drains completely (`backlog: 0`) with all events and their frames
+intact. Manually restarting the container (`docker compose start
+consumer`) was sufficient to trigger a full catch-up. The
+automatic-restart gap above affects *recovery time*, not data integrity
+— the queue itself is the safety net regardless of whether the consumer
+comes back on its own or via manual intervention.
 
 ## What each part does
 
@@ -84,38 +82,121 @@ on its own or via manual intervention.
   applicable) onto a Redis list (`events_queue`) and returns `202`. It
   never touches SQLite directly — ingestion and processing are two
   separate concerns.
+- **`cloud/api.py` → `POST /telemetry`** — accepts a telemetry
+  alarm/resolved event (not raw per-reading data — see "Telemetry"
+  below for why), validates `device_id`, `metric`, `value`, and `status`
+  are present, pushes it onto a separate `telemetry_queue`, returns
+  `202`. Kept as its own endpoint and queue rather than folded into
+  `/events`, since it's a structurally different kind of signal (device
+  health vs. product defects).
 - **`cloud/api.py` → `GET /frames/<filename>`** — serves a previously
   uploaded frame back out. Exists so a retraining job (or a future
   dashboard) can actually retrieve what was captured, not just store it.
 - **`cloud/api.py` → `GET /metrics`** — reports `total_events`,
-  `backlog` (current Redis queue length), `events_by_type` (`new_class`
-  vs `alarm`), `alarms_by_class` (which defects trigger alarms most
-  often), and `frames_captured` (how many stored events have an attached
-  frame).
-- **`cloud/consumer.py`** — a separate process. Blocks on the Redis
-  queue (`BRPOP`, 5s timeout) and on each event writes a row into a
-  SQLite `events` table (`event_type`, `device_id`, `class`,
-  `confidence`, `frame_path`, `timestamp`). Runs independently of the
-  API so a slow/stuck consumer can never block ingestion.
-- **`simulator/simulate.py`** — every loop iteration captures one frame
-  first (`capture_frame()`: a small randomly-generated placeholder
+  `backlog` (combined length of both queues), `events_by_type`
+  (`new_class` vs `alarm`), `alarms_by_class` (which defects trigger
+  alarms most often), `frames_captured`, `telemetry_alerts_total`, and
+  `telemetry_by_metric` (alarm/resolved counts per monitored signal).
+- **`cloud/consumer.py`** — a single process, `BLPOP`-ing on *both*
+  `events_queue` and `telemetry_queue` at once (Redis returns whichever
+  has data first), routing each item into the `events` table or the
+  `telemetry_alerts` table based on which queue it came from. One
+  process serving two queues rather than two separate consumers, since
+  the volume here doesn't justify splitting them.
+- **`simulator/simulate.py`** — every loop iteration does two things:
+  defect detection and telemetry sampling. For defects: captures one
+  frame first (`capture_frame()`: a small randomly-generated placeholder
   image — dummy images are explicitly fine per the brief), *then* runs
-  `mock_inference()` against it to get a class + confidence. This
-  ordering is deliberate: a real device captures continuously and only
-  finds out afterward whether a frame was interesting, so inference
-  can't run before capture. The brief's two trigger rules decide the
-  event type: first time seeing a class → `new_class`; confidence ≥
-  `CONFIDENCE_THRESHOLD` (0.85) → `alarm`. Every event that actually
-  gets sent (new-class *or* alarm — see "Architecture & design choices"
-  below) carries its frame; frames that never lead to a sent event are
-  deleted immediately, since a real device shouldn't hoard captures with
-  no use. If the API is unreachable, the event (and its frame's file
-  path) is appended to a local `outbox.json` instead of being dropped;
-  every loop iteration calls `flush_outbox()` first, retrying anything
-  still buffered before sending the current frame's event. A frame is
-  only deleted locally once its event is confirmed received (`202`) —
-  during an outage the file sits untouched in `captured_frames/`,
-  available for the retry, exactly like the event data itself.
+  `mock_inference()` against it to get a class + confidence — this
+  ordering is deliberate, since a real device captures continuously and
+  only finds out afterward whether a frame was interesting. The brief's
+  two trigger rules decide the event type: first time seeing a class →
+  `new_class`; confidence ≥ `CONFIDENCE_THRESHOLD` (0.85) → `alarm`.
+  Every event that actually gets sent carries its frame; frames that
+  never lead to a sent event are deleted immediately. For telemetry: see
+  the dedicated "Telemetry" section below. Both defect events and
+  telemetry alarms share the same buffering mechanism — if the API is
+  unreachable, the item (event or telemetry alarm) is appended to a
+  local `outbox.json` instead of being dropped, tagged with which
+  endpoint it belongs to; every loop iteration calls `flush_outbox()`
+  first, retrying anything still buffered before generating new data. A
+  frame is only deleted locally once its event is confirmed received
+  (`202`) — during an outage the file sits untouched in
+  `captured_frames/`, available for the retry.
+
+## Telemetry: windowed anomaly detection
+
+The idea behind this feature: a single noisy telemetry reading shouldn't
+raise an alarm on its own — a real device's temperature sensor can spike
+for a second for all kinds of harmless reasons, and alerting on every
+spike would make the alarm channel useless through noise. Instead,
+`simulate.py` keeps a **sliding window of the last 10 readings per
+metric**, and only raises an alarm if **at least 6 of those 10**
+individually breached the metric's threshold (a K-of-N / debounce rule
+— the same pattern real monitoring tools like Prometheus use: "alert if
+X has been true for the last N minutes," not "alert the instant X is
+true once").
+
+The alarm is **edge-triggered**, not level-triggered: it fires once on
+the transition into breach (`status: "alarm"`) and once on the
+transition back out (`status: "resolved"`), not on every tick while the
+problem persists — otherwise a sustained issue would resend the same
+alarm dozens of times. Telemetry alarms reuse the exact same
+outbox/retry mechanism as defect events (see above), so they survive a
+cloud outage the same way — a temperature alarm that fails to send gets
+buffered and retried, not dropped.
+
+**Only `temp_c` is monitored for now**, to keep the windowing behavior
+easy to demonstrate and verify. Extending to additional signals
+(`cpu_load`, `gpu_load`, `disk_free_pct`) is a one-line addition to the
+`TELEMETRY_METRICS` dict in `simulate.py` — `api.py` and `consumer.py`
+are already metric-agnostic (they group and store by whatever `metric`
+name arrives in the payload), so nothing on the cloud side needs to
+change to add more signals.
+
+**Verified**: since random noise alone is unlikely to produce 6-of-10
+breaches within a short test run, a deterministic stress window is built
+in (`temp_c` is forced high for ticks 15–24), guaranteeing the alarm
+fires at least once per run rather than depending on luck. A captured
+run shows exactly the intended behavior — one alarm, one resolution,
+nothing repeated in between despite temperature staying elevated across
+multiple ticks in that window, and no alarms anywhere else in the run
+despite isolated single-reading spikes happening under the hood (by
+design, a 10% per-tick chance of one noisy reading that should be
+absorbed by the window):
+
+```
+Telemetry alarm: temp_c=93.1C (6/10 readings breached threshold)
+...
+Telemetry resolved: temp_c=52.7C (5/10 readings breached threshold)
+```
+
+Confirmed landing correctly in storage (not just printed to console) via
+`curl http://localhost:8000/metrics` — `telemetry_alerts_total` and
+`telemetry_by_metric` both reflect the alarm/resolved pair.
+
+### What's *not* implemented: full telemetry transport
+
+The K-of-N alarm above only ships a small, rare *derived* event to the
+cloud (a state change), not the continuous raw readings themselves —
+that's a deliberate scope decision, and the transport question for the
+raw stream is still design-only, not built:
+
+Telemetry (CPU/GPU/temp/sensor readings) differs from alarms and frames
+in two ways that argue for different handling than what's built above.
+Value density is much lower — one confidence alarm is actionable on its
+own, one raw CPU-temperature reading generally isn't. And volume is much
+higher and constant, not event-triggered, unlike the rare windowed
+alarm. Given that, for the *raw* stream I'd go **hybrid**:
+full-resolution telemetry stays on local disk (a rolling window,
+overwritten as it fills), and only a downsampled summary ships to the
+cloud on a slow interval, over MQTT rather than a synchronous HTTP POST
+per reading — built for exactly this "many small messages, unreliable
+network" case. Deep debugging on a specific device could pull the full
+local log directly from it. The windowed alarm mechanism above and this
+raw-stream question are complementary, not redundant: the alarm tells
+you *something is wrong right now*, the raw stream (if built) would let
+you investigate *why*, after the fact.
 
 ## Verified: zero-loss outage recovery, including frames
 
@@ -173,6 +254,12 @@ Verified after this run: every buffered event's frame was still present
 in `cloud/data/frames/`, and `GET /frames/<filename>` served each one
 back successfully.
 
+*(This log predates the telemetry feature — the outbox has since been
+generalized to hold both event and telemetry items, so a fresh run's
+resync message now reads "Resynced N item(s)" rather than "N events."
+The mechanism and guarantee are identical; see the "Telemetry" section
+above for telemetry specifically surviving an outage.)*
+
 ## Final validation pass
 
 Beyond the outage test above, a full clean-slate protocol was run once
@@ -201,6 +288,11 @@ testing:
 7. **Final consistency check** — after all of the above, `/metrics`
    showed `backlog: 0` and internally consistent totals across
    `events_by_type`, `alarms_by_class`, and `frames_captured`.
+8. **Telemetry windowing** — ran a fresh simulator session through the
+   deterministic stress window (ticks 15–24); confirmed exactly one
+   `alarm` and one `resolved` transition printed and stored, no spurious
+   alarms elsewhere in the run despite isolated random spikes occurring,
+   and `/metrics` reflecting both entries under `telemetry_by_metric`.
 
 ## Architecture & design choices
 
@@ -275,20 +367,16 @@ afterward decides whether a given frame was interesting. Frames that
 don't lead to a sent event are deleted immediately rather than kept, to
 avoid a real device accumulating captures with no purpose.
 
-## Local disk vs. MQTT vs. hybrid for telemetry
-
-Not implemented as working code — the brief lists this as a design
-decision to reason about, not a required component — but the reasoning:
-telemetry (CPU/GPU/temp/sensor readings) differs from alarms and frames
-in two ways that argue for different handling. Value density is much
-lower — one confidence alarm is actionable on its own, one CPU-temperature
-reading generally isn't. And volume is much higher and constant, not
-event-triggered. Given that, I'd go **hybrid**: full-resolution telemetry
-stays on local disk (a rolling window, overwritten as it fills), and
-only a downsampled summary ships to the cloud on a slow interval, over
-MQTT rather than a synchronous HTTP POST per reading — built for exactly
-this "many small messages, unreliable network" case. Deep debugging on
-a specific device can pull the full local log directly from it.
+**Telemetry alarms use a separate endpoint and queue from defect
+events, but share the consumer process.** `/telemetry` and
+`telemetry_queue` are kept distinct from `/events` and `events_queue`
+because they're structurally different signals (device health vs.
+product defects, windowed-and-rare vs. per-frame). But a single
+`consumer.py` process drains both via `BLPOP` on two keys rather than
+running two separate consumer processes, since the current volume
+doesn't justify the added operational complexity of two things to
+deploy, monitor, and restart independently. Full reasoning on the
+windowing approach itself is in the "Telemetry" section above.
 
 ## What breaks going from 1 factory / 1 device to 50 factories / 20 devices each
 
@@ -301,7 +389,10 @@ That's 1 → 1,000 devices. A few things stop being fine:
   — I'd move to something with partitioning and consumer groups (Kafka)
   so throughput scales with the number of consumers.
 - **One consumer process can't keep up** — needs to become horizontally
-  scalable, or backlog grows unbounded during any traffic spike.
+  scalable, or backlog grows unbounded during any traffic spike. This
+  applies to the combined `events_queue` + `telemetry_queue` consumer
+  too — at fleet scale I'd likely split them back into separate
+  consumers so a telemetry backlog can't delay defect-event processing.
 - **Frames on every alarm gets expensive at fleet scale.** Attaching a
   full frame to every alarm (not just new-class) is fine for one
   simulated device; at 1,000 devices it's a real bandwidth and storage
@@ -328,18 +419,20 @@ That's 1 → 1,000 devices. A few things stop being fine:
   local take-home (the brief explicitly asks for `docker compose up`,
   not a cloud deployment) but not something that carries over as-is.
   Production needs a real DNS domain for the ingestion API behind a load
-  balancer, HTTPS instead of plain HTTP, and the device's `API_URL`
+  balancer, HTTPS instead of plain HTTP, and the device's `BASE_URL`
   moved from a hardcoded string into device-provisioned configuration.
   Redis and the database would sit in a private network, never exposed
   publicly the way they are on `localhost` today.
 - **Device identity and security** — anything can currently `POST` to
-  `/events` claiming any `device_id`; production needs per-device
-  certificates (mutual TLS) so the ingestion service can verify a device
-  before trusting its data.
+  `/events` or `/telemetry` claiming any `device_id`; production needs
+  per-device certificates (mutual TLS) so the ingestion service can
+  verify a device before trusting its data.
 - **Observability** — `/metrics` here is pull-based and manual.
   Production needs structured logging/metrics from both the API and
   consumer, plus alerting on backlog growth specifically, since a
-  growing queue backlog is exactly the signal that something's unhealthy.
+  growing queue backlog is exactly the signal that something's unhealthy
+  — including a telemetry-specific backlog, so a device-health problem
+  doesn't quietly go unnoticed behind a healthy-looking overall metric.
 - **OTA updates** — out of scope to build, but I'd design toward:
   versioned model artifacts in a registry, staged/canary rollout before
   fleet-wide push, and a rollback path.
@@ -361,9 +454,16 @@ That's 1 → 1,000 devices. A few things stop being fine:
   restart re-reports already-seen classes as new. A real device would
   persist this locally so a reboot doesn't retrigger new-class events —
   noted as a known simplification given the time budget, not fixed.
-- Telemetry ingestion itself isn't implemented (see the hybrid section
-  above) — only alarm and new-class events (with frames) are wired
-  end-to-end.
+- Telemetry alarm detection is implemented for `temp_c` only, with the
+  K-of-N window and thresholds as constants in `simulate.py` rather than
+  device-configurable — a real fleet would likely need per-device or
+  per-deployment-environment thresholds (a factory floor runs hotter
+  than a lab). Extending to more signals is straightforward (see
+  "Telemetry" above); making thresholds configurable per device was not,
+  given the time budget.
+- Continuous raw telemetry transport (as opposed to the derived
+  alarm/resolved events, which are implemented) remains design-only —
+  see "What's not implemented: full telemetry transport" above.
 - The Docker restart policy is declared and confirmed applied to all
   three services, but automatic restart-on-crash itself could not be
   confirmed working on the development machine's Docker Desktop

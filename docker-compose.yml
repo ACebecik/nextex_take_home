@@ -16,6 +16,7 @@ services:
     environment:
       - REDIS_HOST=redis
       - DB_PATH=/app/data/events.db
+      - FRAMES_DIR=/app/data/frames
     volumes:
       - ./cloud/data:/app/data
 

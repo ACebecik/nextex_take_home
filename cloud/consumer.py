@@ -2,7 +2,6 @@ import redis
 import sqlite3
 import json
 import time
-
 import os
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
@@ -14,10 +13,11 @@ conn = sqlite3.connect(DB_PATH)
 
 c = conn.execute('''CREATE TABLE IF NOT EXISTS events
              (id INTEGER PRIMARY KEY AUTOINCREMENT,
-             event_type TEXT NOT NULL,          
+             event_type TEXT NOT NULL,
              device_id TEXT NOT NULL,
              class TEXT NOT NULL,
              confidence REAL NOT NULL,
+             frame_path TEXT,
              timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
 conn.commit()
@@ -31,7 +31,7 @@ while True:
         event_data = redis_client.brpop('events_queue', timeout=5)
     except redis.exceptions.TimeoutError:
         print("Redis connection timed out. Retrying...")
-        time.sleep(1)  # Wait for a second before retrying
+        time.sleep(1)
         continue
 
     if event_data is None:
@@ -40,11 +40,10 @@ while True:
     event_json = event_data[1]  # BRPOP returns (queue_name, value)
     event = json.loads(event_json)
 
-    # Insert the event into the SQLite database
-    c.execute('''INSERT INTO events (event_type, device_id, class, confidence)
-                 VALUES (?, ?, ?, ?)''', (event['event_type'], event['device_id'], event['class'], event['confidence']))
+    c.execute('''INSERT INTO events (event_type, device_id, class, confidence, frame_path)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (event['event_type'], event['device_id'], event['class'],
+               event['confidence'], event.get('frame_path')))
     conn.commit()
 
-
     print(f"Event stored in database: {event}")
-

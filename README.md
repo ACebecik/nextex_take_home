@@ -8,6 +8,7 @@ anomaly-detection pipeline, plus design notes (Part 3).
 ```
 nextex_take_home/
 ├── docker-compose.yml
+├── architecture_diagram.png
 ├── cloud/
 │   ├── Dockerfile
 │   ├── api.py          # Flask app: POST /events, GET /frames/<file>, GET /metrics
@@ -64,6 +65,7 @@ re-verifying on a different Docker environment before relying on it.
 
 Separately confirmed: even without automatic restart, no data is lost
 while `consumer` is down — Redis holds the full backlog (`backlog: 15`
+<<<<<<< Updated upstream
 in `/metrics`) until a consumer resumes reading, at which point it
 drains completely (`backlog: 0`) with all events and their frames intact.
 Manually restarting the container (`docker compose start consumer`) was
@@ -73,6 +75,15 @@ itself is the safety net regardless of whether the consumer comes back
 on its own or via manual intervention.
 
 
+=======
+observed in `/metrics`) until a consumer resumes reading, at which point
+it drains completely (`backlog: 0`) with all events and their frames
+intact. Manually restarting the container (`docker compose start
+consumer`) was sufficient to trigger a full catch-up. The
+automatic-restart gap above affects *recovery time*, not data integrity
+— the queue itself is the safety net regardless of whether the consumer
+comes back on its own or via manual intervention.
+>>>>>>> Stashed changes
 
 ## What each part does
 
@@ -105,16 +116,16 @@ on its own or via manual intervention.
   can't run before capture. The brief's two trigger rules decide the
   event type: first time seeing a class → `new_class`; confidence ≥
   `CONFIDENCE_THRESHOLD` (0.85) → `alarm`. Every event that actually
-  gets sent (new-class *or* alarm — see "Why these choices" below)
-  carries its frame; frames that never lead to a sent event are deleted
-  immediately, since a real device shouldn't hoard captures with no use.
-  If the API is unreachable, the event (and its frame's file path) is
-  appended to a local `outbox.json` instead of being dropped; every loop
-  iteration calls `flush_outbox()` first, retrying anything still
-  buffered before sending the current frame's event. A frame is only
-  deleted locally once its event is confirmed received (`202`) — during
-  an outage the file sits untouched in `captured_frames/`, available for
-  the retry, exactly like the event data itself.
+  gets sent (new-class *or* alarm — see "Architecture & design choices"
+  below) carries its frame; frames that never lead to a sent event are
+  deleted immediately, since a real device shouldn't hoard captures with
+  no use. If the API is unreachable, the event (and its frame's file
+  path) is appended to a local `outbox.json` instead of being dropped;
+  every loop iteration calls `flush_outbox()` first, retrying anything
+  still buffered before sending the current frame's event. A frame is
+  only deleted locally once its event is confirmed received (`202`) —
+  during an outage the file sits untouched in `captured_frames/`,
+  available for the retry, exactly like the event data itself.
 
 ## Verified: zero-loss outage recovery, including frames
 
@@ -201,7 +212,36 @@ testing:
    showed `backlog: 0` and internally consistent totals across
    `events_by_type`, `alarms_by_class`, and `frames_captured`.
 
-## Why these choices
+## Architecture & design choices
+
+![End-to-end architecture: factory edge devices → connectivity → cloud backend → storage → ML training/deployment loop → frontend](architecture_diagram.png)
+
+The system follows the chain factory edge devices → connectivity → cloud
+backend services → storage → ML training/deployment loop → frontend.
+Solid-border boxes in the diagram are implemented and tested in this
+repo; dashed-border boxes (the training/deployment loop and the
+frontend) are designed but explicitly out of scope as working code per
+the assignment.
+
+On the device side, the edge captures a frame every cycle and runs
+(mocked) inference against it, buffering locally to `outbox.json`
+whenever the cloud is unreachable — this is the piece proven end to end
+in the outage tests above. Connectivity is treated as unreliable by
+design rather than assumed away: nothing on the device side depends on
+the network being up at any given moment. On the cloud side, ingestion
+deliberately decouples *receiving* an event from *processing* it — the
+API's only job is to validate and enqueue, and a separate consumer
+process drains the queue into storage — so a slow or crashed consumer
+can never block a device from successfully reporting an event. Storage
+splits structured event data from frame blobs rather than mixing them,
+since they have very different access patterns (frequent small queries
+vs. occasional large reads). The training loop and frontend are drawn to
+show where this pipeline would connect to next — a retraining job
+pulling frames via `GET /frames/<filename>`, and a dashboard reading the
+same `/metrics` endpoint already built — without having built either,
+since the brief marks both as optional.
+
+The specific technology choices within that architecture:
 
 **Redis for the queue.** Single binary, no config, `LPUSH`/`BRPOP` is
 enough for the producer/consumer split the brief asks for. Kafka or

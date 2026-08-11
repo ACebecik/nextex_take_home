@@ -81,13 +81,12 @@ docker compose start api       # bring it back
 curl http://localhost:8000/metrics   # totals include everything, buffered or not
 ```
 
-** Simulator Logs on Catchup/Resync Missing Events
+###Simulator Logs on Catchup/Resync Missing Events
 
 Captured run — 10 events sent normally, `api` container stopped mid-run
 (19 events buffered locally), container restarted, full backlog resynced
 with zero loss:
-
-​```
+```
 Sent event: {'device_id': 'jetson-01', 'class': 'needle_mark', 'confidence': 0.94, 'event_type': 'new_class'}, Response: 202
 Sent event: {'device_id': 'jetson-01', 'class': 'needle_mark', 'confidence': 1.0, 'event_type': 'alarm'}, Response: 202
 Sent event: {'device_id': 'jetson-01', 'class': 'oil_stain', 'confidence': 0.89, 'event_type': 'new_class'}, Response: 202
@@ -118,7 +117,7 @@ Failed to send event: {'device_id': 'jetson-01', 'class': 'vertical_lines', 'con
 Failed to send event: {'device_id': 'jetson-01', 'class': 'pinched_fabric', 'confidence': 0.97, 'event_type': 'alarm'}
 Failed to send event: {'device_id': 'jetson-01', 'class': 'needle_mark', 'confidence': 0.95, 'event_type': 'alarm'}
 Resynced 19 events from outbox, 0 events remain in outbox.
-​```
+```
 
 
 

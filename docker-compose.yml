@@ -1,0 +1,29 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: ./cloud
+    command: python api.py
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - DB_PATH=/app/data/events.db
+    volumes:
+      - ./cloud/data:/app/data
+
+  consumer:
+    build: ./cloud
+    command: python consumer.py
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - DB_PATH=/app/data/events.db
+    volumes:
+      - ./cloud/data:/app/data

@@ -81,7 +81,7 @@ docker compose start api       # bring it back
 curl http://localhost:8000/metrics   # totals include everything, buffered or not
 ```
 
-###Simulator Logs on Catchup/Resync Missing Events
+### Simulator Logs on Catchup/Resync Missing Events
 
 Captured run — 10 events sent normally, `api` container stopped mid-run
 (19 events buffered locally), container restarted, full backlog resynced

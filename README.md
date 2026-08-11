@@ -62,6 +62,18 @@ configuration problem — the policy is correctly declared and applied —
 but it's noted here rather than silently assumed to work. Worth
 re-verifying on a different Docker environment before relying on it.
 
+Separately confirmed: even without automatic restart, no data is lost
+while `consumer` is down — Redis holds the full backlog (`backlog: 15`
+in `/metrics`) until a consumer resumes reading, at which point it
+drains completely (`backlog: 0`) with all events and their frames intact.
+Manually restarting the container (`docker compose start consumer`) was
+sufficient to trigger a full catch-up. This means the automatic-restart
+gap noted above affects *recovery time*, not data integrity — the queue
+itself is the safety net regardless of whether the consumer comes back
+on its own or via manual intervention.
+
+
+
 ## What each part does
 
 - **`cloud/api.py` → `POST /events`** — accepts either plain JSON or

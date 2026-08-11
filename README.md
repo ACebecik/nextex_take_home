@@ -65,7 +65,6 @@ re-verifying on a different Docker environment before relying on it.
 
 Separately confirmed: even without automatic restart, no data is lost
 while `consumer` is down — Redis holds the full backlog (`backlog: 15`
-<<<<<<< Updated upstream
 in `/metrics`) until a consumer resumes reading, at which point it
 drains completely (`backlog: 0`) with all events and their frames intact.
 Manually restarting the container (`docker compose start consumer`) was
@@ -75,15 +74,6 @@ itself is the safety net regardless of whether the consumer comes back
 on its own or via manual intervention.
 
 
-=======
-observed in `/metrics`) until a consumer resumes reading, at which point
-it drains completely (`backlog: 0`) with all events and their frames
-intact. Manually restarting the container (`docker compose start
-consumer`) was sufficient to trigger a full catch-up. The
-automatic-restart gap above affects *recovery time*, not data integrity
-— the queue itself is the safety net regardless of whether the consumer
-comes back on its own or via manual intervention.
->>>>>>> Stashed changes
 
 ## What each part does
 
